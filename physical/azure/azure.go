@@ -2,20 +2,20 @@ package azure
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
+	"github.com/Azure/go-autorest/autorest/adal"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	storage "github.com/Azure/azure-sdk-for-go/storage"
+	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest/azure"
 	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
-	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/helper/strutil"
 	"github.com/hashicorp/vault/sdk/physical"
@@ -31,7 +31,7 @@ const (
 // AzureBackend is a physical backend that stores data
 // within an Azure blob container.
 type AzureBackend struct {
-	container  *storage.Container
+	container  azblob.ContainerURL
 	logger     log.Logger
 	permitPool *physical.PermitPool
 }
@@ -62,9 +62,7 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 	accountKey := os.Getenv("AZURE_ACCOUNT_KEY")
 	if accountKey == "" {
 		accountKey = conf["accountKey"]
-		if accountKey == "" {
-			return nil, fmt.Errorf("'accountKey' must be set")
-		}
+		// accountKey can be "" if we are using MSI
 	}
 
 	environmentName := os.Getenv("AZURE_ENVIRONMENT")
@@ -99,19 +97,38 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 		}
 	}
 
-	client, err := storage.NewBasicClientOnSovereignCloud(accountName, accountKey, environment)
-	if err != nil {
-		return nil, errwrap.Wrapf("failed to create Azure client: {{err}}", err)
-	}
-	client.HTTPClient = cleanhttp.DefaultPooledClient()
-
-	blobClient := client.GetBlobService()
-	container := blobClient.GetContainerReference(name)
-	_, err = container.CreateIfNotExists(&storage.CreateContainerOptions{
-		Access: storage.ContainerAccessTypePrivate,
+	azureAuth, err := auth(environment.ResourceIdentifiers.Storage)
+	client := azblob.NewTokenCredential(azureAuth.Token().AccessToken, func(credential azblob.TokenCredential) (expires time.Duration) {
+		azureAuth.Refresh()
+		expireIn, err := azureAuth.Token().ExpiresIn.Int64()
+		if err != nil {
+			return 0
+		}
+		expires = time.Duration(expireIn) * time.Second
+		return
 	})
+
+	p := azblob.NewPipeline(client, azblob.PipelineOptions{})
+
+	URL, _ := url.Parse(
+		fmt.Sprintf("https://%s.blob.%s/%s", accountName, environment.StorageEndpointSuffix, name))
+
+	containerURL := azblob.NewContainerURL(*URL, p)
+	ctx := context.Background()
+
+	_, err = containerURL.GetProperties(ctx, azblob.LeaseAccessConditions{})
 	if err != nil {
-		return nil, errwrap.Wrapf(fmt.Sprintf("failed to create %q container: {{err}}", name), err)
+		if aerr, ok := err.(azblob.StorageError); ok {
+			switch aerr.ServiceCode() {
+			case azblob.ServiceCodeContainerNotFound:
+			default:
+				return nil, errwrap.Wrapf(fmt.Sprintf("failed to get properties for container %q: {{err}}", name), aerr)
+			}
+		}
+		_, err = containerURL.Create(ctx, azblob.Metadata{}, azblob.PublicAccessNone)
+		if err != nil {
+			return nil, errwrap.Wrapf(fmt.Sprintf("failed to create %q container: {{err}}", name), err)
+		}
 	}
 
 	maxParStr, ok := conf["max_parallel"]
@@ -127,7 +144,7 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 	}
 
 	a := &AzureBackend{
-		container:  container,
+		container:  containerURL,
 		logger:     logger,
 		permitPool: physical.NewPermitPool(maxParInt),
 	}
@@ -142,22 +159,30 @@ func (a *AzureBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		return fmt.Errorf("value is bigger than the current supported limit of 4MBytes")
 	}
 
-	blockID := base64.StdEncoding.EncodeToString([]byte("AAAA"))
-	blocks := make([]storage.Block, 1)
-	blocks[0] = storage.Block{ID: blockID, Status: storage.BlockStatusLatest}
+	//blockID := base64.StdEncoding.EncodeToString([]byte("AAAA"))
+	//blocks := make([]storage.Block, 1)
+	//blocks[0] = storage.Block{ID: blockID, Status: storage.BlockStatusLatest}
+	//
+	//a.permitPool.Acquire()
+	//defer a.permitPool.Release()
+	//
+	//blob := &storage.Blob{
+	//	Container: a.container,
+	//	Name:      entry.Key,
+	//}
+	//if err := blob.PutBlock(blockID, entry.Value, nil); err != nil {
+	//	return err
+	//}
 
-	a.permitPool.Acquire()
-	defer a.permitPool.Release()
-
-	blob := &storage.Blob{
-		Container: a.container,
-		Name:      entry.Key,
-	}
-	if err := blob.PutBlock(blockID, entry.Value, nil); err != nil {
-		return err
-	}
-
-	return blob.PutBlockList(blocks, nil)
+	blobURL := a.container.NewBlockBlobURL(entry.Key)
+	_, err := azblob.UploadBufferToBlockBlob(ctx, entry.Value, blobURL, azblob.UploadToBlockBlobOptions{
+		BlockSize: MaxBlobSize,
+		Parallelism: 1,
+	})
+	return err
+	//
+	//
+	//return blob.PutBlockList(blocks, nil)
 }
 
 // Get is used to fetch an entry
@@ -167,22 +192,20 @@ func (a *AzureBackend) Get(ctx context.Context, key string) (*physical.Entry, er
 	a.permitPool.Acquire()
 	defer a.permitPool.Release()
 
-	blob := &storage.Blob{
-		Container: a.container,
-		Name:      key,
-	}
-	exists, err := blob.Exists()
+	blobURL := a.container.NewBlobURL(key)
+	downloadResponse, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false)
 	if err != nil {
+		if aerr, ok := err.(azblob.StorageError); ok {
+			switch aerr.ServiceCode() {
+			case azblob.ServiceCodeBlobNotFound:
+				return nil, nil
+			default:
+				return nil, errwrap.Wrapf(fmt.Sprintf("failed to download blob %q: {{err}}", key), aerr)
+			}
+		}
 		return nil, err
 	}
-	if !exists {
-		return nil, nil
-	}
-
-	reader, err := blob.Get(nil)
-	if err != nil {
-		return nil, err
-	}
+	reader := downloadResponse.Body(azblob.RetryReaderOptions{MaxRetryRequests: 20})
 	defer reader.Close()
 	data, err := ioutil.ReadAll(reader)
 
@@ -198,15 +221,9 @@ func (a *AzureBackend) Get(ctx context.Context, key string) (*physical.Entry, er
 func (a *AzureBackend) Delete(ctx context.Context, key string) error {
 	defer metrics.MeasureSince([]string{"azure", "delete"}, time.Now())
 
-	blob := &storage.Blob{
-		Container: a.container,
-		Name:      key,
-	}
+	blobURL := a.container.NewBlobURL(key)
+	_, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
 
-	a.permitPool.Acquire()
-	defer a.permitPool.Release()
-
-	_, err := blob.DeleteIfExists(nil)
 	return err
 }
 
@@ -218,20 +235,20 @@ func (a *AzureBackend) List(ctx context.Context, prefix string) ([]string, error
 	a.permitPool.Acquire()
 	defer a.permitPool.Release()
 
-	var marker string
 	keys := []string{}
-	for {
-		list, err := a.container.ListBlobs(storage.ListBlobsParameters{
-			Prefix:     prefix,
-			Marker:     marker,
-			MaxResults: MaxListResults,
+
+	for marker := (azblob.Marker{}); marker.NotDone(); {
+		listBlob, err := a.container.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{
+			Prefix: prefix,
 		})
 		if err != nil {
 			return nil, err
 		}
+		marker = listBlob.NextMarker
 
-		for _, blob := range list.Blobs {
-			key := strings.TrimPrefix(blob.Name, prefix)
+		// Process the blobs returned in this result segment (if the segment is empty, the loop body won't execute)
+		for _, blobInfo := range listBlob.Segment.BlobItems {
+			key := strings.TrimPrefix(blobInfo.Name, prefix)
 			if i := strings.Index(key, "/"); i == -1 {
 				// file
 				keys = append(keys, key)
@@ -240,13 +257,31 @@ func (a *AzureBackend) List(ctx context.Context, prefix string) ([]string, error
 				keys = strutil.AppendIfMissing(keys, key[:i+1])
 			}
 		}
-
-		if list.NextMarker == "" {
-			break
-		}
-		marker = list.NextMarker
 	}
 
 	sort.Strings(keys)
 	return keys, nil
+}
+
+func auth(resouce string) (*adal.ServicePrincipalToken, error) {
+	msiEndpoint, err := adal.GetMSIVMEndpoint()
+	if err != nil {
+		return nil, err
+	}
+	spt, err := adal.NewServicePrincipalTokenFromMSI(msiEndpoint, resouce)
+	if err != nil {
+		return nil, err
+	}
+	if err := spt.Refresh(); err != nil {
+		return nil, err
+	}
+	token := spt.Token()
+	if token.IsZero() {
+		return nil, err
+	}
+	return spt, nil
+}
+
+func refresher(credential azblob.TokenCredential) time.Duration {
+	return 0
 }
