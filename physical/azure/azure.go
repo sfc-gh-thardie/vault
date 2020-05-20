@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/Azure/go-autorest/autorest/adal"
+	"github.com/hashicorp/vault/sdk/physical"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -14,11 +15,9 @@ import (
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest/azure"
-	metrics "github.com/armon/go-metrics"
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/vault/sdk/helper/strutil"
-	"github.com/hashicorp/vault/sdk/physical"
 )
 
 const (
@@ -98,10 +97,20 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 	}
 
 	azureAuth, err := auth(environment.ResourceIdentifiers.Storage)
+	if err != nil {
+		errorMsg := fmt.Sprintf("failed to authenticate against storage account %q: {{err}}",
+			environmentName)
+		return nil, errwrap.Wrapf(errorMsg, err)
+	}
 	client := azblob.NewTokenCredential(azureAuth.Token().AccessToken, func(credential azblob.TokenCredential) (expires time.Duration) {
-		azureAuth.Refresh()
+		err = azureAuth.Refresh()
+		if err != nil {
+			logger.Error("[Error] couldn't refresh token credential")
+			return 0
+		}
 		expireIn, err := azureAuth.Token().ExpiresIn.Int64()
 		if err != nil {
+			logger.Error("[Error] couldn't retrieve jwt claim for 'expiresIn' from refreshed token")
 			return 0
 		}
 		expires = time.Duration(expireIn) * time.Second
@@ -159,30 +168,12 @@ func (a *AzureBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		return fmt.Errorf("value is bigger than the current supported limit of 4MBytes")
 	}
 
-	//blockID := base64.StdEncoding.EncodeToString([]byte("AAAA"))
-	//blocks := make([]storage.Block, 1)
-	//blocks[0] = storage.Block{ID: blockID, Status: storage.BlockStatusLatest}
-	//
-	//a.permitPool.Acquire()
-	//defer a.permitPool.Release()
-	//
-	//blob := &storage.Blob{
-	//	Container: a.container,
-	//	Name:      entry.Key,
-	//}
-	//if err := blob.PutBlock(blockID, entry.Value, nil); err != nil {
-	//	return err
-	//}
-
 	blobURL := a.container.NewBlockBlobURL(entry.Key)
 	_, err := azblob.UploadBufferToBlockBlob(ctx, entry.Value, blobURL, azblob.UploadToBlockBlobOptions{
-		BlockSize: MaxBlobSize,
+		BlockSize:   MaxBlobSize,
 		Parallelism: 1,
 	})
 	return err
-	//
-	//
-	//return blob.PutBlockList(blocks, nil)
 }
 
 // Get is used to fetch an entry
@@ -235,8 +226,7 @@ func (a *AzureBackend) List(ctx context.Context, prefix string) ([]string, error
 	a.permitPool.Acquire()
 	defer a.permitPool.Release()
 
-	keys := []string{}
-
+	var keys []string
 	for marker := (azblob.Marker{}); marker.NotDone(); {
 		listBlob, err := a.container.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{
 			Prefix: prefix,
@@ -263,12 +253,12 @@ func (a *AzureBackend) List(ctx context.Context, prefix string) ([]string, error
 	return keys, nil
 }
 
-func auth(resouce string) (*adal.ServicePrincipalToken, error) {
+func auth(resource string) (*adal.ServicePrincipalToken, error) {
 	msiEndpoint, err := adal.GetMSIVMEndpoint()
 	if err != nil {
 		return nil, err
 	}
-	spt, err := adal.NewServicePrincipalTokenFromMSI(msiEndpoint, resouce)
+	spt, err := adal.NewServicePrincipalTokenFromMSI(msiEndpoint, resource)
 	if err != nil {
 		return nil, err
 	}
@@ -280,8 +270,4 @@ func auth(resouce string) (*adal.ServicePrincipalToken, error) {
 		return nil, err
 	}
 	return spt, nil
-}
-
-func refresher(credential azblob.TokenCredential) time.Duration {
-	return 0
 }
