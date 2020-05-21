@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/hashicorp/vault/sdk/physical"
+	"github.com/hashicorp/vault/sdk/helper/strutil"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -113,7 +114,9 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 			logger.Error("[Error] couldn't retrieve jwt claim for 'expiresIn' from refreshed token")
 			return 0
 		}
-		expires = time.Duration(expireIn) * time.Second
+		expires = time.Duration(int(float64(expireIn) * 0.8)) * time.Second
+		credential.SetToken(azureAuth.Token().AccessToken)
+		logger.Info("Refreshed token. Expires in ", azureAuth.Token().ExpiresIn.Int64())
 		return
 	})
 
