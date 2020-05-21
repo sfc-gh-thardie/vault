@@ -116,7 +116,7 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 		}
 		expires = time.Duration(int(float64(expireIn) * 0.8)) * time.Second
 		credential.SetToken(azureAuth.Token().AccessToken)
-		logger.Info("Refreshed token. Expires in ", azureAuth.Token().ExpiresIn.Int64())
+		logger.Info("Refreshed token. Expires in ", expireIn)
 		return
 	})
 
