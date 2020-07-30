@@ -106,17 +106,17 @@ func NewAzureBackend(conf map[string]string, logger log.Logger) (physical.Backen
 	client := azblob.NewTokenCredential(azureAuth.Token().AccessToken, func(credential azblob.TokenCredential) (expires time.Duration) {
 		err = azureAuth.Refresh()
 		if err != nil {
-			logger.Error("[Error] couldn't refresh token credential")
+			logger.Error("couldn't refresh token credential", "error", err)
 			return 0
 		}
 		expireIn, err := azureAuth.Token().ExpiresIn.Int64()
 		if err != nil {
-			logger.Error("[Error] couldn't retrieve jwt claim for 'expiresIn' from refreshed token")
+			logger.Error("couldn't retrieve jwt claim for 'expiresIn' from refreshed token", "error", err)
 			return 0
 		}
-		expires = time.Duration(int(float64(expireIn) * 0.8)) * time.Second
+		expires = time.Duration(int(float64(expireIn)*0.8)) * time.Second
 		credential.SetToken(azureAuth.Token().AccessToken)
-		logger.Info("Refreshed token. Expires in ", expireIn)
+		logger.Debug("refreshed token, new token expires in", "access_token_expiry", expireIn)
 		return
 	})
 
@@ -171,11 +171,15 @@ func (a *AzureBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		return fmt.Errorf("value is bigger than the current supported limit of 4MBytes")
 	}
 
+	a.permitPool.Acquire()
+	defer a.permitPool.Release()
+
 	blobURL := a.container.NewBlockBlobURL(entry.Key)
 	_, err := azblob.UploadBufferToBlockBlob(ctx, entry.Value, blobURL, azblob.UploadToBlockBlobOptions{
 		BlockSize:   MaxBlobSize,
 		Parallelism: 1,
 	})
+
 	return err
 }
 
@@ -200,7 +204,7 @@ func (a *AzureBackend) Get(ctx context.Context, key string) (*physical.Entry, er
 		return nil, err
 	}
 	reader := downloadResponse.Body(azblob.RetryReaderOptions{MaxRetryRequests: 20})
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	data, err := ioutil.ReadAll(reader)
 
 	ent := &physical.Entry{
@@ -214,6 +218,9 @@ func (a *AzureBackend) Get(ctx context.Context, key string) (*physical.Entry, er
 // Delete is used to permanently delete an entry
 func (a *AzureBackend) Delete(ctx context.Context, key string) error {
 	defer metrics.MeasureSince([]string{"azure", "delete"}, time.Now())
+
+	a.permitPool.Acquire()
+	defer a.permitPool.Release()
 
 	blobURL := a.container.NewBlobURL(key)
 	_, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
@@ -261,16 +268,20 @@ func auth(resource string) (*adal.ServicePrincipalToken, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	spt, err := adal.NewServicePrincipalTokenFromMSI(msiEndpoint, resource)
 	if err != nil {
 		return nil, err
 	}
+
 	if err := spt.Refresh(); err != nil {
 		return nil, err
 	}
+
 	token := spt.Token()
 	if token.IsZero() {
 		return nil, err
 	}
+
 	return spt, nil
 }
