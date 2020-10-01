@@ -3,9 +3,6 @@ package azure
 import (
 	"context"
 	"fmt"
-	"github.com/Azure/go-autorest/autorest/adal"
-	"github.com/hashicorp/vault/sdk/helper/strutil"
-	"github.com/hashicorp/vault/sdk/physical"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -13,6 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Azure/go-autorest/autorest/adal"
+	"github.com/hashicorp/vault/sdk/helper/strutil"
+	"github.com/hashicorp/vault/sdk/physical"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest/azure"
@@ -224,6 +225,16 @@ func (a *AzureBackend) Delete(ctx context.Context, key string) error {
 
 	blobURL := a.container.NewBlobURL(key)
 	_, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
+	if err != nil {
+		if aerr, ok := err.(azblob.StorageError); ok {
+			switch aerr.ServiceCode() {
+			case azblob.ServiceCodeBlobNotFound:
+				return nil
+			default:
+				return errwrap.Wrapf(fmt.Sprintf("failed to delete blob %q: {{err}}", key), err)
+			}
+		}
+	}
 
 	return err
 }
